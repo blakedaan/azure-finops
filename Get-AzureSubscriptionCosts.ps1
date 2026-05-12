@@ -174,20 +174,30 @@ $results = foreach ($sub in $subs) {
         $null
     }
 
+    # Build a combined status so partial results (one call OK, one failed) are visible
+    $combinedStatus = if ($actual.Status -eq "OK" -and $amortized.Status -eq "OK") {
+        "OK"
+    } elseif ($actual.Status -eq "OK" -and $amortized.Status -ne "OK") {
+        "Partial: AmortizedCost failed ($($amortized.Status))"
+    } else {
+        $actual.Status
+    }
+
     [PSCustomObject]@{
         Subscription   = $sub.Name
         SubscriptionId = $sub.Id
         ActualCost     = $actual.Cost
         AmortizedCost  = $amortized.Cost
         Delta          = $delta
-        Status         = $actual.Status
+        Status         = $combinedStatus
     }
 }
 
 # ---------------------------------------------
 # Output results
 # ---------------------------------------------
-$accessible   = $results | Where-Object { $_.Status -eq "OK" }
+# Include "Partial" rows in accessible so ActualCost is still reported
+$accessible   = $results | Where-Object { $_.Status -eq "OK" -or $_.Status -like "Partial*" }
 $inaccessible = $results | Where-Object { $_.Status -ne "OK" }
 
 Write-Host "`n=== SUBSCRIPTION COSTS (where you have Cost Management access) ===" -ForegroundColor Green
