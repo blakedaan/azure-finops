@@ -13,7 +13,7 @@
 
     - AmortizedCost: Spreads reservation and savings plan costs evenly across the
                      period they cover. Closer to what appears in invoice-based
-                     billing exports (like Rick's pivot report).
+                     billing exports.
 
     The delta between the two reveals how much savings plan/reservation spend is
     affecting any given subscription in the queried period.
@@ -50,7 +50,7 @@
         - Authenticated via Connect-AzAccount
         - Cost Management Reader on target subscription(s) or higher scope
 
-    Author: Blake Daniel
+    Author: Blake Daniels
     Repo:   github.com/bdaniel/finops
 #>
 
@@ -106,10 +106,11 @@ if (-not $subs) {
     exit 1
 }
 
-Write-Host "Found $($subs.Count) subscription(s). Querying Cost Management API (2 calls per sub)..." -ForegroundColor Cyan
+Write-Host "Found $($subs.Count) subscription(s). Querying Cost Management API (3 calls per sub)..." -ForegroundColor Cyan
 
 # ---------------------------------------------
 # Helper function - queries one cost type for one subscription
+# Only requests Cost which is valid at subscription scope.
 # API Ref: https://learn.microsoft.com/en-us/rest/api/cost-management/query/usage
 # ---------------------------------------------
 function Get-SubCost {
@@ -120,6 +121,7 @@ function Get-SubCost {
         [string]$To
     )
 
+    # Main cost query - only uses Cost which is valid at subscription scope
     $body = @{
         type       = $CostType
         timeframe  = "Custom"
@@ -142,18 +144,89 @@ function Get-SubCost {
         $response = Invoke-AzRestMethod -Method POST -Path $uri -Payload $body
 
         if ($response.StatusCode -eq 200) {
-            $data = $response.Content | ConvertFrom-Json
-            $cost = if ($data.properties.rows.Count -gt 0) {
-                [math]::Round($data.properties.rows[0][0], 2)
-            } else {
-                0.00
+            $data    = $response.Content | ConvertFrom-Json
+            $columns = $data.properties.columns.name
+            $rows    = $data.properties.rows
+
+            $getCol = {
+                param($colName)
+                $idx = [array]::IndexOf($columns, $colName)
+                if ($idx -ge 0 -and $rows.Count -gt 0) {
+                    [math]::Round($rows[0][$idx], 2)
+                } else { $null }
             }
+
+            $cost = & $getCol "Cost"
             return @{ Cost = $cost; Status = "OK" }
         } else {
             return @{ Cost = $null; Status = "HTTP $($response.StatusCode) - No access or API error" }
         }
     } catch {
         return @{ Cost = $null; Status = "Exception: $_" }
+    }
+}
+
+# ---------------------------------------------
+# Separate tax query - isolated so a 400 here does not affect main results
+# Tax and CostWithTax are MCA/EA billing account scope fields only.
+# Expected to fail at subscription scope - surfaced clearly in output.
+# ---------------------------------------------
+function Get-SubTax {
+    param (
+        [string]$SubscriptionId,
+        [string]$From,
+        [string]$To
+    )
+
+    $body = @{
+        type       = "ActualCost"
+        timeframe  = "Custom"
+        timePeriod = @{ from = $From; to = $To }
+        dataset    = @{
+            granularity = "None"
+            aggregation = @{
+                totalCost        = @{ name = "Cost";        function = "Sum" }
+                totalTax         = @{ name = "Tax";         function = "Sum" }
+                totalCostWithTax = @{ name = "CostWithTax"; function = "Sum" }
+            }
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $uri = "/subscriptions/$SubscriptionId/providers/Microsoft.CostManagement/query?api-version=2023-11-01"
+
+    try {
+        $response = Invoke-AzRestMethod -Method POST -Path $uri -Payload $body
+
+        if ($response.StatusCode -eq 200) {
+            $data    = $response.Content | ConvertFrom-Json
+            $columns = $data.properties.columns.name
+            $rows    = $data.properties.rows
+
+            $getCol = {
+                param($colName)
+                $idx = [array]::IndexOf($columns, $colName)
+                if ($idx -ge 0 -and $rows.Count -gt 0) {
+                    [math]::Round($rows[0][$idx], 2)
+                } else { $null }
+            }
+
+            $tax         = & $getCol "Tax"
+            $costWithTax = & $getCol "CostWithTax"
+
+            $taxStatus = if ($null -ne $tax -and $tax -gt 0) {
+                "Available"
+            } elseif ($null -ne $tax) {
+                "Returned zero - likely subscription scope limitation"
+            } else {
+                "Unavailable - requires Billing Account scope"
+            }
+
+            return @{ Tax = $tax; CostWithTax = $costWithTax; TaxStatus = $taxStatus }
+        } else {
+            return @{ Tax = $null; CostWithTax = $null; TaxStatus = "Unavailable - requires Billing Account scope (HTTP $($response.StatusCode))" }
+        }
+    } catch {
+        return @{ Tax = $null; CostWithTax = $null; TaxStatus = "Exception: $_" }
     }
 }
 
@@ -183,12 +256,19 @@ $results = foreach ($sub in $subs) {
         $actual.Status
     }
 
+    # Tax queried separately so a failure does not affect ActualCost/AmortizedCost
+    $taxData = Get-SubTax -SubscriptionId $sub.Id -From $StartDate -To $EndDate
+
     [PSCustomObject]@{
         Subscription   = $sub.Name
         SubscriptionId = $sub.Id
-        ActualCost     = $actual.Cost
-        AmortizedCost  = $amortized.Cost
-        Delta          = $delta
+        # Coerce null to 0.00 so blank cells never appear in output
+        ActualCost     = if ($null -ne $actual.Cost)         { $actual.Cost }         else { 0.00 }
+        AmortizedCost  = if ($null -ne $amortized.Cost)      { $amortized.Cost }      else { 0.00 }
+        Delta          = if ($null -ne $delta)               { $delta }               else { 0.00 }
+        Tax            = if ($null -ne $taxData.Tax)         { $taxData.Tax }         else { "N/A" }
+        CostWithTax    = if ($null -ne $taxData.CostWithTax) { $taxData.CostWithTax } else { "N/A" }
+        TaxStatus      = $taxData.TaxStatus
         Status         = $combinedStatus
     }
 }
@@ -202,13 +282,20 @@ $inaccessible = $results | Where-Object { $_.Status -ne "OK" }
 
 Write-Host "`n=== SUBSCRIPTION COSTS (where you have Cost Management access) ===" -ForegroundColor Green
 $accessible | Sort-Object AmortizedCost -Descending |
-    Format-Table Subscription, SubscriptionId, ActualCost, AmortizedCost, Delta -AutoSize
+    Format-Table Subscription, SubscriptionId, ActualCost, AmortizedCost, Delta, Tax, CostWithTax -AutoSize
 
 $actualTotal    = [math]::Round(($accessible | Measure-Object -Property ActualCost    -Sum).Sum, 2)
 $amortizedTotal = [math]::Round(($accessible | Measure-Object -Property AmortizedCost -Sum).Sum, 2)
 
 Write-Host "Accessible Subscriptions -- ActualCost Total:    `$$actualTotal"    -ForegroundColor Green
 Write-Host "Accessible Subscriptions -- AmortizedCost Total: `$$amortizedTotal" -ForegroundColor Green
+
+# Report tax data availability - confirms whether Billing Account scope is needed
+$taxStatuses = $accessible | Select-Object -ExpandProperty TaxStatus -Unique
+Write-Host "`n=== TAX DATA AVAILABILITY ===" -ForegroundColor Cyan
+$accessible | Select-Object Subscription, Tax, CostWithTax, TaxStatus | Format-Table -AutoSize
+Write-Host "Note: Tax and CostWithTax require Billing Account Reader scope (MCA/EA)." -ForegroundColor Cyan
+Write-Host "      If Tax shows zero or unavailable, request Billing Account Reader via PIM.`n" -ForegroundColor Cyan
 
 if ($inaccessible) {
     Write-Host "`n=== SUBSCRIPTIONS WITH NO COST MANAGEMENT ACCESS ===" -ForegroundColor Yellow
